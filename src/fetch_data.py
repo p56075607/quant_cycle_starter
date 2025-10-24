@@ -1,103 +1,36 @@
-
-"""
-fetch_data.py
---------------
-一鍵抓取「景氣/週期」回測所需的核心指標 + 常用補充指標，並輸出到 data/sample/。
-預設使用 FRED + yfinance + 世界銀行 +（可選）台灣中央銀行(CBC) API。
-
-使用前準備：
-1) 安裝套件：
-   pip install fredapi yfinance pandas pandas-datareader pandasdmx requests python-dateutil
-
-2) 設定環境變數：
-   - FRED_API_KEY=<你的FRED金鑰>  （https://fred.stlouisfed.org/docs/api/api_key.html）
-
-執行：
-   python src/fetch_data.py
-
-輸出（核心，與 starter 專案對上）：
-   data/sample/PMI.csv                # 欄: date, PMI                  -> 來源: FRED: NAPM（ISM製造業PMI）
-   data/sample/INDPRO_yoy.csv         # 欄: date, INDPRO_yoy           -> 來源: FRED: INDPRO（年增率計算）
-   data/sample/UNRATE_chg3m.csv       # 欄: date, UNRATE_chg3m         -> 來源: FRED: UNRATE（三個月變化）
-   data/sample/TERM_10y_2y.csv        # 欄: date, TERM_10y_2y          -> 來源: FRED: DGS10 - DGS2
-   data/sample/CreditSpread.csv       # 欄: date, CreditSpread         -> 來源: FRED: BAMLH0A0HYM2（HY OAS）
-   data/sample/SP500.csv              # 欄: date, AdjClose             -> 來源: FRED: SP500（價位）
-
-   （選配）ETF 價格：VT、IEF、GLD、IWM、TLT、DBC -> data/sample/<TICKER>.csv（欄: date, AdjClose）
-
-附加：
-   reports/data_sources.csv           # 指標對應來源與系列代碼一覽（你可以打開檢查/擴充）
-
-注意：
-- 本腳本會把高頻日資料轉成「月底月頻」以避免前視偏誤；並對宏觀指標採「上月→下月初生效」的自然滯後（你也可以在回測層控制）。
-- 若你在台灣資料想接 CBC（M1B/M2等），請填入 CBC_ITEMS 內的代碼（預設示範 'EF21M01en' = Factors responsible for changes in M2, Monthly）。
-"""
-
+# src/fetch_data.py
+# Comments in English for clarity; Traditional Chinese in docstrings.
 import os
-import sys
 import io
 import json
-import time
-import math
-import traceback
-from dataclasses import dataclass
-from datetime import datetime
+import argparse
 from typing import Dict, List, Optional
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import requests
-from dateutil.relativedelta import relativedelta
 
-# 可選: fredapi / yfinance
+# Optional libs
 try:
     from fredapi import Fred
-except Exception as e:
+except Exception:
     Fred = None
 
 try:
     import yfinance as yf
-except Exception as e:
+except Exception:
     yf = None
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "sample")
-REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# ========== 指標對應表（主項 + 系列代碼/來源） ==========
-INDICATORS = [
-    # 回測核心 ─ 與 starter 專案欄位/檔名一致
-    {"name":"PMI",            "source":"FRED", "series_id":"MANEMP",          "notes":"ISM Manufacturing PMI (MANEMP, formerly NAPM)"},
-    {"name":"INDPRO_yoy",     "source":"FRED", "series_id":"INDPRO",          "notes":"工業生產指數→年增率"},  # 計算
-    {"name":"UNRATE_chg3m",   "source":"FRED", "series_id":"UNRATE",          "notes":"失業率→近三個月變化"},  # 計算
-    {"name":"TERM_10y_2y",    "source":"FRED", "series_id":"DGS10-DGS2",      "notes":"10Y-2Y 期限利差（DGS10 - DGS2）"},  # 計算
-    {"name":"CreditSpread",   "source":"FRED", "series_id":"BAMLH0A0HYM2",    "notes":"ICE BofA US High Yield OAS"},
-    {"name":"SP500",          "source":"FRED", "series_id":"SP500",           "notes":"標普500（價位）"},
-
-    # 附加（常用）：可自由擴充
-    {"name":"CPI_US_yoy",     "source":"FRED", "series_id":"CPIAUCSL",        "notes":"美國CPI YoY（由月度CPI計算年增率）"},
-    {"name":"FEDFUNDS",       "source":"FRED", "series_id":"FEDFUNDS",        "notes":"聯邦基金有效利率（EFFECTIVE）"},
-    {"name":"M2SL_yoy",       "source":"FRED", "series_id":"M2SL",            "notes":"美國M2年增率（由M2SL計算）"},
-
-    # 世界銀行（年頻，做視角輔助，不進回測核心）
-    {"name":"WB_WLD_GDP_yoy","source":"WB",   "series_id":"NY.GDP.MKTP.KD.ZG","notes":"世界 GDP 成長率（WLD）"},
-    {"name":"WB_WLD_CPI_yoy","source":"WB",   "series_id":"FP.CPI.TOTL.ZG",   "notes":"世界 CPI 年增率（WLD）"},
-]
-
-# 台灣 CBC API（選配）：項目代碼清單（可自行擴充/改為其他 M1B/M2等表）
-CBC_ITEMS = [
-    # 'EF21M01en',  # Factors responsible for changes in Monetary Aggregate M2, Monthly（英文代碼；結構需自行展開欄位）
-]
-
-ETF_TICKERS = ["VT", "IEF", "GLD", "IWM", "TLT", "DBC"]
-
-# ========== 小工具 ==========
+# ------------------------
+# Helpers (shared)
+# ------------------------
 def month_end(s: pd.Series) -> pd.Series:
-    """轉月底月頻；若原本就是月頻也會對齊月底"""
+    """Resample to month-end without forward-filling."""
     s = s.dropna()
     s.index = pd.to_datetime(s.index)
-    s = s.resample("ME").last()
+    s = s.resample("M").last()
     s.index.name = "date"
     return s
 
@@ -115,24 +48,31 @@ def save_two_col_csv(path: str, name: str, series: pd.Series):
     df.reset_index().to_csv(path, index=False, encoding="utf-8")
     print(f"[OK] {path} -> {len(df)} rows")
 
+def ensure_dirs(*paths: str):
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
+
+
+# ------------------------
+# US data (FRED / ETF / World Bank)
+# ------------------------
 def _fred_client() -> Optional["Fred"]:
     api_key = os.environ.get("FRED_API_KEY", "").strip()
     if not api_key:
-        print("[WARN] FRED_API_KEY 未設定，fredapi 需要金鑰。請至 https://fred.stlouisfed.org/docs/api/api_key.html 申請並設為環境變數。")
+        print("[WARN] FRED_API_KEY not set. Get one at https://fred.stlouisfed.org/docs/api/api_key.html")
         return None
     if Fred is None:
-        print("[ERROR] 未安裝 fredapi，請先 pip install fredapi")
+        print("[ERROR] fredapi not installed. pip install fredapi")
         return None
     return Fred(api_key=api_key)
 
 def fetch_fred_series(series_id: str) -> pd.Series:
     fred = _fred_client()
     if fred is None:
-        raise RuntimeError("FRED client 未就緒")
+        raise RuntimeError("FRED client not ready")
     return fred.get_series(series_id)
 
 def fetch_world_bank_series(indicator: str, country: str="WLD") -> pd.Series:
-    # World Bank API: https://api.worldbank.org/v2/country/WLD/indicator/NY.GDP.MKTP.KD.ZG?format=json&per_page=20000
     url = f"https://api.worldbank.org/v2/country/{country}/indicator/{indicator}"
     r = requests.get(url, params={"format":"json","per_page":20000}, timeout=30)
     r.raise_for_status()
@@ -145,20 +85,38 @@ def fetch_world_bank_series(indicator: str, country: str="WLD") -> pd.Series:
     s.index.name = "date"
     return s
 
-def fetch_cbc_item(item_code: str) -> pd.DataFrame:
-    """央行統計資料庫 API： https://cpx.cbc.gov.tw/API/DataAPI/Get?FileName=<ItemCode>"""
+def fetch_etf_price(ticker: str) -> pd.Series:
+    if yf is None:
+        raise RuntimeError("yfinance not installed. pip install yfinance")
+    data = yf.download(ticker, period="max", auto_adjust=True, progress=False)
+    if "Close" not in data.columns:
+        raise RuntimeError(f"yfinance has no Close for: {ticker}")
+    s = data["Close"].rename("AdjClose")
+    return month_end(s)
+
+
+# ------------------------
+# Taiwan data (DGBAS / CBC)
+# ------------------------
+def fetch_cbc_item(item_code: str) -> dict:
+    """
+    中央銀行統計資料庫 API
+    GET https://cpx.cbc.gov.tw/API/DataAPI/Get?FileName=<ItemCode>
+    回傳 JSON，表格結構依 item_code 而異。此函式回傳:
+      {
+        "raw": <original json>,
+        "flat": <扁平化DataFrame，僅抓 TIME/TIME_PERIOD 與 OBS_VALUE 類欄位>
+      }
+    """
     url = "https://cpx.cbc.gov.tw/API/DataAPI/Get"
     r = requests.get(url, params={"FileName": item_code}, timeout=60)
     r.raise_for_status()
     j = r.json()
-    raw_path = os.path.join(REPORTS_DIR, f"CBC_{item_code}.json")
-    with open(raw_path, "w", encoding="utf-8") as f:
-        json.dump(j, f, ensure_ascii=False, indent=2)
-    print(f"[OK] 已保存 CBC 原始 JSON -> {raw_path}")
 
+    # Flatten (best-effort)
     ds = j.get("DataSet", {})
     tables = ds.get("diffgr:diffgram", {}).get("NewDataSet", {})
-    records = []
+    rows = []
     if isinstance(tables, dict):
         for k, v in tables.items():
             if isinstance(v, list):
@@ -167,8 +125,8 @@ def fetch_cbc_item(item_code: str) -> pd.DataFrame:
                         t = row.get("TIME") or row.get("TIME_PERIOD") or row.get("Time") or row.get("time")
                         val = row.get("OBS_VALUE") or row.get("Value") or row.get("value")
                         if t is not None and val is not None:
-                            records.append({"date": t, "value": val, "table": k})
-    df = pd.DataFrame(records)
+                            rows.append({"date": t, "value": val, "table": k})
+    df = pd.DataFrame(rows)
     if not df.empty:
         def _to_dt(x):
             x = str(x)
@@ -181,154 +139,240 @@ def fetch_cbc_item(item_code: str) -> pd.DataFrame:
         df["date"] = df["date"].map(_to_dt)
         df = df.dropna(subset=["date"]).sort_values("date")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df
+    return {"raw": j, "flat": df}
 
-def fetch_etf_price(ticker: str) -> pd.Series:
-    if yf is None:
-        raise RuntimeError("尚未安裝 yfinance，請先 pip install yfinance")
-    # 使用 Ticker 物件來下載，避免 download 函數問題
-    ticker_obj = yf.Ticker(ticker)
-    data = ticker_obj.history(period="max", auto_adjust=True)
-    if data.empty or "Close" not in data.columns:
-        raise RuntimeError(f"yfinance 無法取得 {ticker} 的資料")
-    s = data["Close"].rename("AdjClose")
-    return month_end(s)
+def fetch_dgbas_sdmx(path_after_sdmx: str, start: Optional[str]=None, end: Optional[str]=None) -> dict:
+    """
+    主計總處 (DGBAS) SDMX 介面（API-JSON）
+    典型語法：
+      https://nstatdb.dgbas.gov.tw/dgbasAll/webMain.aspx?sdmx/<功能代碼>/<維度鍵>.M&startTime=YYYY-MM&endTime=YYYY-MM
 
-def main():
-    # 1) FRED 核心
-    fred_needed = {
-        "PMI": "MANEMP",
-        "INDPRO": "INDPRO",
-        "UNRATE": "UNRATE",
-        "DGS10": "DGS10",
-        "DGS2": "DGS2",
-        "CreditSpread": "BAMLH0A0HYM2",
-        "SP500": "SP500",
-        # 附加
-        "CPIAUCSL": "CPIAUCSL",
-        "FEDFUNDS": "FEDFUNDS",
-        "M2SL": "M2SL",
-    }
+    你要做的事：
+      1) 確認功能代碼（例如 失業率/物價/工業生產 對應之表）
+      2) 用網站提供的查詢工具拿到 <維度鍵> 字串
+      3) 把 "<功能代碼>/<維度鍵>.M" 放到 path_after_sdmx 參數
 
-    fred_data: Dict[str, pd.Series] = {}
-    if _fred_client() is None:
-        print("[FRED] 跳過（沒有金鑰或未安裝 fredapi）")
-    else:
-        for key, sid in fred_needed.items():
-            try:
-                s = fetch_fred_series(sid)
-                fred_data[key] = s
-                print(f"[FRED] {key} <- {sid}: {len(s)} obs")
-            except Exception as e:
-                print(f"[WARN] FRED 抓取失敗 {key} ({sid}): {e}")
+    回傳:
+      {
+        "raw": <API JSON>,
+        "flat": <扁平化DataFrame（TIME_PERIOD vs OBS_VALUE），需視表而調整>
+      }
+    """
+    base = "https://nstatdb.dgbas.gov.tw/dgbasAll/webMain.aspx"
+    qs = f"sdmx/{path_after_sdmx}"
+    if start:
+        qs += f"&startTime={start}"
+    if end:
+        qs += f"&endTime={end}"
+    url = f"{base}?{qs}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    j = r.json()
 
-    # PMI
-    pmi = pd.Series(dtype=float, name="PMI")
-    if "PMI" in fred_data:
-        pmi = month_end(fred_data["PMI"]).rename("PMI")
-    else:
+    # Flatten (generic TIME / OBS_VALUE)
+    records = []
+    # 結構會依表不同，以下為常見字段名稱
+    ds = j.get("dataSet", j.get("DataSet", {}))
+    # API-JSON 與 SDMX-JSON 在 DGBAS 兩種回法都有，先盡量兼容：
+    # 嘗試針對 SDMX-JSON 結構 (series/observations)
+    if "structure" in j and "dataSets" in j:
         try:
-            pmi = month_end(fetch_fred_series("MANEMP")).rename("PMI")
+            series = j["dataSets"][0]["series"]
+            dims = j["structure"]["dimensions"]["series"]
+            time_list = j["structure"]["dimensions"]["observation"][0]["values"]
+            for series_key, obs in series.items():
+                # series_key like "0:1:0:..." -> decode labels if needed
+                for time_idx, val in obs["observations"].items():
+                    t = time_list[int(time_idx)]["id"]  # YYYY-MM
+                    v = val[0]
+                    records.append({"date": t, "value": v})
         except Exception:
             pass
-    if not pmi.empty:
-        save_two_col_csv(os.path.join(DATA_DIR, "PMI.csv"), "PMI", pmi)
 
-    # INDPRO_yoy
-    if "INDPRO" in fred_data:
-        indpro_yoy = pct_change_yoy(fred_data["INDPRO"]).rename("INDPRO_yoy")
-        save_two_col_csv(os.path.join(DATA_DIR, "INDPRO_yoy.csv"), "INDPRO_yoy", indpro_yoy)
+    # 若上面抓不到，再試 API-JSON 的 NewDataSet 模式
+    if not records:
+        nds = j.get("diffgr:diffgram", {}).get("NewDataSet", {})
+        if isinstance(nds, dict):
+            for k, lst in nds.items():
+                if isinstance(lst, list):
+                    for row in lst:
+                        t = row.get("TIME") or row.get("TIME_PERIOD") or row.get("Time")
+                        v = row.get("OBS_VALUE") or row.get("Value")
+                        if t is not None and v is not None:
+                            records.append({"date": t, "value": v})
 
-    # UNRATE_chg3m
-    if "UNRATE" in fred_data:
-        unrate_chg3m = diff_3m(fred_data["UNRATE"]).rename("UNRATE_chg3m")
-        save_two_col_csv(os.path.join(DATA_DIR, "UNRATE_chg3m.csv"), "UNRATE_chg3m", unrate_chg3m)
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+    return {"raw": j, "flat": df}
 
-    # TERM_10y_2y
-    if "DGS10" in fred_data and "DGS2" in fred_data:
-        ts = month_end(fred_data["DGS10"]) - month_end(fred_data["DGS2"])
-        ts.name = "TERM_10y_2y"
-        save_two_col_csv(os.path.join(DATA_DIR, "TERM_10y_2y.csv"), "TERM_10y_2y", ts)
 
-    # CreditSpread
-    if "CreditSpread" in fred_data:
-        cs = month_end(fred_data["CreditSpread"]).rename("CreditSpread")
-        save_two_col_csv(os.path.join(DATA_DIR, "CreditSpread.csv"), "CreditSpread", cs)
+# ------------------------
+# Specs you can extend
+# ------------------------
+ETF_TICKERS = ["VT", "IEF", "GLD", "IWM", "TLT", "DBC"]
 
-    # SP500 價格（欄位要叫 AdjClose 以接 Starter）
-    if "SP500" in fred_data:
-        spx = month_end(fred_data["SP500"]).rename("AdjClose")
-        save_two_col_csv(os.path.join(DATA_DIR, "SP500.csv"), "AdjClose", spx)
+US_FRED_SERIES = {
+    "PMI": "NAPM",
+    "INDPRO": "INDPRO",
+    "UNRATE": "UNRATE",
+    "DGS10": "DGS10",
+    "DGS2":  "DGS2",
+    "CreditSpread": "BAMLH0A0HYM2",
+    "SP500": "SP500",
+    # optional extras
+    "CPIAUCSL": "CPIAUCSL",
+    "FEDFUNDS": "FEDFUNDS",
+    "M2SL": "M2SL",
+}
 
-    # 3) 附加常用衍生
-    if "CPIAUCSL" in fred_data:
-        cpi_yoy = pct_change_yoy(fred_data["CPIAUCSL"]).rename("CPI_US_yoy")
-        save_two_col_csv(os.path.join(DATA_DIR, "CPI_US_yoy.csv"), "CPI_US_yoy", cpi_yoy)
-    if "FEDFUNDS" in fred_data:
-        ffr = month_end(fred_data["FEDFUNDS"]).rename("FEDFUNDS")
-        save_two_col_csv(os.path.join(DATA_DIR, "FEDFUNDS.csv"), "FEDFUNDS", ffr)
-    if "M2SL" in fred_data:
-        m2_yoy = pct_change_yoy(fred_data["M2SL"]).rename("M2SL_yoy")
-        save_two_col_csv(os.path.join(DATA_DIR, "M2SL_yoy.csv"), "M2SL_yoy", m2_yoy)
+# ---- Taiwan presets ----
+# 央行 CBC：兩個可直接跑的示例（其餘請自行把 item code 補入）
+CBC_ITEM_CODES = [
+    # 美元/台幣（美元兌新台幣）日資料（英文代碼；官方頁面找 "BP01D01en"）
+    "BP01D01en",
+    # M2 變動因素（示例，表結構較複雜，輸出 raw 與 basic flat）
+    "EF21M01en",
+]
 
-    # 4) 世界銀行（年頻：世界視角），輸出到 reports/
-    try:
-        w_gdp = fetch_world_bank_series("NY.GDP.MKTP.KD.ZG", "WLD").rename("GDP_yoy")
-        w_cpi = fetch_world_bank_series("FP.CPI.TOTL.ZG", "WLD").rename("CPI_yoy")
-        df_w = pd.concat([w_gdp, w_cpi], axis=1).dropna(how="all")
-        df_w.index.name = "date"
-        df_w.reset_index().to_csv(os.path.join(REPORTS_DIR, "worldbank_WLD.csv"), index=False, encoding="utf-8")
-        print(f"[OK] reports/worldbank_WLD.csv -> {len(df_w)} rows")
-    except Exception as e:
-        print(f"[WARN] 世界銀行抓取失敗: {e}")
+# DGBAS：請把 <功能代碼>/<維度鍵>.M 放入下方，比如：
+# - CPI（總指數、月頻、季調或未季調依你需求）
+# - 失業率（總失業率、月頻）
+# - 工業生產指數（總指數、月頻）
+# 下面是「範例模板」：請把 YOUR_... 改成實際代碼；或先留空以略過。
+DGBAS_SDMX_PATHS = [
+    # "A010101/<dim_key>.M",   # CPI 總指數（示例代碼，請到 DGBAS 取得正確維度鍵）
+    # "A040101020/<dim_key>.M",# 失業率（示例）
+    # "D2101/<dim_key>.M",     # 工業生產指數（示例）
+]
 
-    # 5) （選配）台灣央行 CBC：若填了 CBC_ITEMS 就抓，輸出到 reports/
-    for item in CBC_ITEMS:
+
+# ------------------------
+# Main pipeline
+# ------------------------
+def run(output_dir: str, with_us: bool=True, with_tw: bool=False, tw_only: bool=False):
+    data_dir = os.path.join(output_dir)
+    reports_dir = os.path.join("reports")
+    ensure_dirs(data_dir, reports_dir)
+
+    # ---------- US ----------
+    if with_us and not tw_only:
+        fred_data: Dict[str, pd.Series] = {}
+        fred = _fred_client()
+        if fred is None:
+            print("[US] Skip FRED (no key or no fredapi).")
+        else:
+            for key, sid in US_FRED_SERIES.items():
+                try:
+                    s = fetch_fred_series(sid)
+                    fred_data[key] = s
+                    print(f"[FRED] {key} <- {sid}: {len(s)} obs")
+                except Exception as e:
+                    print(f"[WARN] FRED fetch fail {key} ({sid}): {e}")
+
+        # Derived outputs (align to starter schema)
+        if "PMI" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "PMI.csv"), "PMI", month_end(fred_data["PMI"]))
+        if "INDPRO" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "INDPRO_yoy.csv"), "INDPRO_yoy", pct_change_yoy(fred_data["INDPRO"]))
+        if "UNRATE" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "UNRATE_chg3m.csv"), "UNRATE_chg3m", diff_3m(fred_data["UNRATE"]))
+        if "DGS10" in fred_data and "DGS2" in fred_data:
+            ts = month_end(fred_data["DGS10"]) - month_end(fred_data["DGS2"])
+            ts.name = "TERM_10y_2y"
+            save_two_col_csv(os.path.join(data_dir, "TERM_10y_2y.csv"), "TERM_10y_2y", ts)
+        if "CreditSpread" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "CreditSpread.csv"), "CreditSpread", month_end(fred_data["CreditSpread"]))
+        if "SP500" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "SP500.csv"), "AdjClose", month_end(fred_data["SP500"]))
+
+        # Extras
+        if "CPIAUCSL" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "CPI_US_yoy.csv"), "CPI_US_yoy", pct_change_yoy(fred_data["CPIAUCSL"]))
+        if "FEDFUNDS" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "FEDFUNDS.csv"), "FEDFUNDS", month_end(fred_data["FEDFUNDS"]))
+        if "M2SL" in fred_data:
+            save_two_col_csv(os.path.join(data_dir, "M2SL_yoy.csv"), "M2SL_yoy", pct_change_yoy(fred_data["M2SL"]))
+
+        # ETFs (optional)
+        if yf is not None:
+            for t in ETF_TICKERS:
+                try:
+                    s = fetch_etf_price(t)
+                    save_two_col_csv(os.path.join(data_dir, f"{t}.csv"), "AdjClose", s)
+                except Exception as e:
+                    print(f"[WARN] ETF {t} failed: {e}")
+
+        # World Bank world view (annual, reference only)
         try:
-            df = fetch_cbc_item(item)
-            if not df.empty:
-                out = os.path.join(REPORTS_DIR, f"CBC_{item}.csv")
-                df.to_csv(out, index=False, encoding="utf-8")
-                print(f"[OK] {out} -> {len(df)} rows")
+            w_gdp = fetch_world_bank_series("NY.GDP.MKTP.KD.ZG", "WLD").rename("GDP_yoy")
+            w_cpi = fetch_world_bank_series("FP.CPI.TOTL.ZG", "WLD").rename("CPI_yoy")
+            df_w = pd.concat([w_gdp, w_cpi], axis=1).dropna(how="all")
+            df_w.index.name = "date"
+            df_w.reset_index().to_csv(os.path.join(reports_dir, "worldbank_WLD.csv"), index=False, encoding="utf-8")
+            print(f"[OK] reports/worldbank_WLD.csv -> {len(df_w)} rows")
         except Exception as e:
-            print(f"[WARN] CBC 抓取失敗 {item}: {e}")
+            print(f"[WARN] World Bank fetch fail: {e}")
 
-    # 6) ETF 價格（選配，接回測資產）
-    if yf is not None:
-        for t in ETF_TICKERS:
+    # ---------- Taiwan ----------
+    if with_tw or tw_only:
+        # CBC examples
+        for item in CBC_ITEM_CODES:
             try:
-                s = fetch_etf_price(t)
-                save_two_col_csv(os.path.join(DATA_DIR, f"{t}.csv"), "AdjClose", s)
+                res = fetch_cbc_item(item)
+                # 1) Save raw JSON
+                raw_path = os.path.join(reports_dir, f"CBC_{item}.json")
+                with open(raw_path, "w", encoding="utf-8") as f:
+                    json.dump(res["raw"], f, ensure_ascii=False, indent=2)
+                # 2) Save basic flat
+                df = res["flat"]
+                if not df.empty:
+                    out = os.path.join(reports_dir, f"CBC_{item}.csv")
+                    df.to_csv(out, index=False, encoding="utf-8")
+                    print(f"[OK] {out} -> {len(df)} rows")
+                # 3) Special mapping examples
+                if item == "BP01D01en":
+                    # USD/TWD daily -> month-end close
+                    if not df.empty:
+                        s = df.set_index("date")["value"].astype(float)
+                        s = month_end(s).rename("USD_TWD")
+                        save_two_col_csv(os.path.join(data_dir, "USD_TWD.csv"), "USD_TWD", s)
+                # EF21M01en is factor table of M2 changes (kept in reports)
             except Exception as e:
-                print(f"[WARN] ETF {t} 下載失敗：{e}")
+                print(f"[WARN] CBC {item} failed: {e}")
 
-    # 7) 輸出來源對照表
-    rows = []
-    for it in INDICATORS:
-        rows.append({
-            "name": it["name"],
-            "source": it["source"],
-            "series_id": it["series_id"],
-            "notes": it.get("notes", ""),
-            "output_csv": {
-                "PMI":"PMI.csv",
-                "INDPRO_yoy":"INDPRO_yoy.csv",
-                "UNRATE_chg3m":"UNRATE_chg3m.csv",
-                "TERM_10y_2y":"TERM_10y_2y.csv",
-                "CreditSpread":"CreditSpread.csv",
-                "SP500":"SP500.csv",
-                "CPI_US_yoy":"CPI_US_yoy.csv",
-                "FEDFUNDS":"FEDFUNDS.csv",
-                "M2SL_yoy":"M2SL_yoy.csv",
-                "WB_WLD_GDP_yoy":"worldbank_WLD.csv",
-                "WB_WLD_CPI_yoy":"worldbank_WLD.csv",
-            }.get(it["name"], "")
-        })
-    pd.DataFrame(rows).to_csv(os.path.join(REPORTS_DIR, "data_sources.csv"), index=False, encoding="utf-8")
-    print(f"[DONE] 指標抓取完成！檔案已輸出到 {DATA_DIR} 與 {REPORTS_DIR}")
-    print("如需更多台灣指標（CPI、失業率、工業生產等），請參考：") 
-    print(" - 主計總處 DGBAS API（需先確認資料表代碼與維度）：https://nstatdb.dgbas.gov.tw/dgbasall/download/API說明文件.pdf")
-    print(" - 央行 CBC API（ItemCode 例如 EF21M01en 等）：https://cpx.cbc.gov.tw/Data/ExportToEnAPIInfo")
+        # DGBAS SDMX paths (fill your own)
+        for sdmx_path in DGBAS_SDMX_PATHS:
+            try:
+                res = fetch_dgbas_sdmx(sdmx_path)
+                raw_path = os.path.join(reports_dir, f"DGBAS_{sdmx_path.replace('/','_')}.json")
+                with open(raw_path, "w", encoding="utf-8") as f:
+                    json.dump(res["raw"], f, ensure_ascii=False, indent=2)
+                df = res["flat"]
+                if not df.empty:
+                    # Heuristic: try to save as two-col (rename as needed)
+                    name = sdmx_path.split("/")[0]
+                    # You can change name mapping below to your desired CSV name/column
+                    col_name = name
+                    s = df.set_index("date")["value"]
+                    save_two_col_csv(os.path.join(data_dir, f"{name}.csv"), col_name, s)
+            except Exception as e:
+                print(f"[WARN] DGBAS {sdmx_path} failed: {e}")
+
+
+# ------------------------
+# CLI
+# ------------------------
+def main():
+    p = argparse.ArgumentParser(description="Fetch macro indicators for US/TW; output CSVs ready for backtest.")
+    p.add_argument("--output-dir", default="data", help="Where to write CSVs (default: data)")
+    p.add_argument("--with-tw", action="store_true", help="Also fetch Taiwan data (CBC/DGBAS)")
+    p.add_argument("--tw-only", action="store_true", help="Fetch only Taiwan data (skip US)")
+    args = p.parse_args()
+
+    run(output_dir=args.output_dir, with_us=not args.tw_only, with_tw=args.with_tw, tw_only=args.tw_only)
 
 if __name__ == "__main__":
     main()
