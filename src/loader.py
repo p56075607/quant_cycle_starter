@@ -5,6 +5,11 @@ from pathlib import Path
 def load_single_csv(path: Path, value_col: str = None) -> pd.Series:
     df = pd.read_csv(path, parse_dates=["date"])
     df = df.set_index("date").sort_index()
+    # 確保索引為 DatetimeIndex（移除時區資訊）
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+    elif df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     if value_col is None:
         cols = [c for c in df.columns if c.lower() != "date"]
         if not cols:
