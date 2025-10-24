@@ -1,0 +1,12 @@
+name,source,series_id,notes,output_csv
+PMI,FRED,MANEMP,"ISM Manufacturing PMI (MANEMP, formerly NAPM)",PMI.csv
+INDPRO_yoy,FRED,INDPRO,工業生產指數→年增率,INDPRO_yoy.csv
+UNRATE_chg3m,FRED,UNRATE,失業率→近三個月變化,UNRATE_chg3m.csv
+TERM_10y_2y,FRED,DGS10-DGS2,10Y-2Y 期限利差（DGS10 - DGS2）,TERM_10y_2y.csv
+CreditSpread,FRED,BAMLH0A0HYM2,ICE BofA US High Yield OAS,CreditSpread.csv
+SP500,FRED,SP500,標普500（價位）,SP500.csv
+CPI_US_yoy,FRED,CPIAUCSL,美國CPI YoY（由月度CPI計算年增率）,CPI_US_yoy.csv
+FEDFUNDS,FRED,FEDFUNDS,聯邦基金有效利率（EFFECTIVE）,FEDFUNDS.csv
+M2SL_yoy,FRED,M2SL,美國M2年增率（由M2SL計算）,M2SL_yoy.csv
+WB_WLD_GDP_yoy,WB,NY.GDP.MKTP.KD.ZG,世界 GDP 成長率（WLD）,worldbank_WLD.csv
+WB_WLD_CPI_yoy,WB,FP.CPI.TOTL.ZG,世界 CPI 年增率（WLD）,worldbank_WLD.csv

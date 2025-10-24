@@ -1,0 +1,51 @@
+etfs:
+- VT
+- IEF
+- GLD
+- IWM
+- QUAL
+- USMV
+- MTUM
+- TLT
+- DBC
+core_universe:
+- VT
+- IEF
+- GLD
+- IWM
+- TLT
+- DBC
+price_column: AdjClose
+rebalance: M
+transaction_cost_bp: 5
+leverage:
+  use: true
+  target_vol: 0.12
+  lookback_months: 12
+  L_min: 0.8
+  L_max: 1.5
+weights:
+  expansion:
+    VT: 0.55
+    IWM: 0.15
+    IEF: 0.15
+    DBC: 0.1
+    GLD: 0.05
+  slowdown:
+    VT: 0.4
+    QUAL: 0.15
+    IEF: 0.3
+    GLD: 0.1
+    USMV: 0.05
+  recession:
+    VT: 0.2
+    TLT: 0.5
+    GLD: 0.15
+    QUAL: 0.1
+    USMV: 0.05
+  recovery:
+    VT: 0.5
+    IWM: 0.15
+    IEF: 0.2
+    GLD: 0.1
+    MTUM: 0.05
