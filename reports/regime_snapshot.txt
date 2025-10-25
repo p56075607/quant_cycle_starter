@@ -1,0 +1,3 @@
+資料區間：2019-03-31 ~ 2025-08-31
+指數：SP500
+最新景氣位階（composite_score）：expansion
